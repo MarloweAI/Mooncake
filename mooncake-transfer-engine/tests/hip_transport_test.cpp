@@ -79,13 +79,14 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     void* src = allocOnDevice(kLen, kSourceDevice);
     void* dst = allocOnDevice(kLen, kSourceDevice);
     ASSERT_EQ(engine->registerLocalMemory(
-                  src, kLen, "cuda:" + std::to_string(kSourceDevice)),
+                  src, kLen, GPU_PREFIX + std::to_string(kSourceDevice)),
               0);
     ASSERT_EQ(engine->registerLocalMemory(
-                  dst, kLen, "cuda:" + std::to_string(kSourceDevice)),
+                  dst, kLen, GPU_PREFIX + std::to_string(kSourceDevice)),
               0);
 
-    auto segment_id = engine->openSegment(server_name);
+    // P2P handshake binds a free port, so open the address it actually uses.
+    auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
     ASSERT_GE(segment_id, 0);
 
     ASSERT_EQ(cudaSetDevice(kSourceDevice), cudaSuccess);
@@ -241,7 +242,8 @@ TEST(HipTransportTest, IpcWriteLandsInBufferInsideLargerAllocation) {
         return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     };
 
-    // The child prints the slice address once it is registered.
+    // The child prints its handshake address and the slice address once the
+    // slice is registered.
     std::string line;
     char c;
     while (read(from_child[0], &c, 1) == 1 && c != '\n') line.push_back(c);
@@ -251,7 +253,10 @@ TEST(HipTransportTest, IpcWriteLandsInBufferInsideLargerAllocation) {
         if (rc == kDstSkip) GTEST_SKIP() << "IPC destination unavailable.";
         FAIL() << "IPC destination exited with " << rc;
     }
-    const uint64_t dst_addr = std::stoull(line);
+    const auto space = line.find(' ');
+    ASSERT_NE(space, std::string::npos) << "unexpected child output: " << line;
+    const std::string dst_name = line.substr(0, space);
+    const uint64_t dst_addr = std::stoull(line.substr(space + 1));
 
     auto engine = std::make_unique<TransferEngine>(false);
     const std::string server_name = "127.0.0.1:17816";
@@ -265,8 +270,7 @@ TEST(HipTransportTest, IpcWriteLandsInBufferInsideLargerAllocation) {
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     ASSERT_EQ(engine->registerLocalMemory(src, kSliceLen, GPU_PREFIX + "0"), 0);
 
-    auto segment_id =
-        engine->openSegment("127.0.0.1:" + std::to_string(dst_port));
+    auto segment_id = engine->openSegment(dst_name);
     ASSERT_GE(segment_id, 0);
     auto batch_id = engine->allocateBatchID(1);
     TransferRequest entry;
