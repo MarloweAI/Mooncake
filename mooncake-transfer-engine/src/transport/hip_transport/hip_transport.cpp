@@ -125,6 +125,51 @@ static int open_fd(const hipxFabricHandle& export_handle) {
     return open_fd;
 }
 
+// Wire format of an IPC BufferDesc::shm_name (hex-encoded):
+//   hipIpcMemHandle_t                       buffer starts its allocation
+//   hipIpcMemHandle_t + uint64_t offset     buffer starts `offset` bytes in
+// The short form is what this transport has always published, so buffers
+// that start their allocation stay compatible with older peers. A peer that
+// predates the long form rejects it ("Mismatched HIP data transfer method")
+// instead of writing to the wrong address.
+static constexpr size_t kIpcHandleBytes = sizeof(hipIpcMemHandle_t);
+static constexpr size_t kIpcHandleWithOffsetBytes =
+    sizeof(hipIpcMemHandle_t) + sizeof(uint64_t);
+
+// Offset of addr from the base of the device allocation that contains it.
+static bool ipcAllocationOffset(void* addr, uint64_t* offset) {
+    hipDeviceptr_t base = nullptr;
+    size_t size = 0;
+    if (!checkHip(hipMemGetAddressRange(&base, &size, (hipDeviceptr_t)addr),
+                  "HipTransport: hipMemGetAddressRange failed")) {
+        return false;
+    }
+    *offset = (uint64_t)addr - (uint64_t)base;
+    return true;
+}
+
+static std::string serializeIpcHandle(const hipIpcMemHandle_t& handle,
+                                      uint64_t offset) {
+    if (offset == 0) return serializeBinaryData(&handle, kIpcHandleBytes);
+    unsigned char payload[kIpcHandleWithOffsetBytes];
+    memcpy(payload, &handle, kIpcHandleBytes);
+    memcpy(payload + kIpcHandleBytes, &offset, sizeof(offset));
+    return serializeBinaryData(payload, sizeof(payload));
+}
+
+static bool isIpcPayload(const std::vector<unsigned char>& buffer) {
+    return buffer.size() == kIpcHandleBytes ||
+           buffer.size() == kIpcHandleWithOffsetBytes;
+}
+
+static uint64_t ipcPayloadOffset(const std::vector<unsigned char>& buffer) {
+    uint64_t offset = 0;
+    if (buffer.size() == kIpcHandleWithOffsetBytes) {
+        memcpy(&offset, buffer.data() + kIpcHandleBytes, sizeof(offset));
+    }
+    return offset;
+}
+
 static int openIPCHandle(const std::vector<unsigned char>& buffer,
                          void** shm_addr) {
     hipIpcMemHandle_t handle;
@@ -694,13 +739,22 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return -1;
         }
 
+        // The handle refers to the whole allocation that contains addr, and
+        // the peer's hipIpcOpenMemHandle maps that allocation's base. A buffer
+        // carved out of a larger allocation (for example by a caching
+        // allocator) therefore starts `ipc_offset` bytes into the mapping.
+        uint64_t ipc_offset = 0;
+        if (!ipcAllocationOffset(addr, &ipc_offset)) {
+            return -1;
+        }
+
         // Register buffer with metadata
         (void)remote_accessible;
         BufferDesc desc;
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
-        desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
+        desc.shm_name = serializeIpcHandle(handle, ipc_offset);
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
 #endif
@@ -766,14 +820,16 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
     for (auto& entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
+            // The registered buffer starts `offset` bytes into the mapping.
+            auto relocate = [&](const OpenedShmEntry& opened) {
+                dest_addr = dest_addr - entry.addr +
+                            ((uint64_t)opened.shm_addr) + opened.offset;
+            };
             // Check if already remapped (shared lock)
             remap_lock_.lockShared();
             if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
-                auto shm_addr =
-                    remap_entries_[std::make_pair(target_id, entry.addr)]
-                        .shm_addr;
+                relocate(remap_entries_[std::make_pair(target_id, entry.addr)]);
                 remap_lock_.unlockShared();
-                dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
                 return 0;
             }
             remap_lock_.unlockShared();
@@ -784,11 +840,12 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                 deserializeBinaryData(entry.shm_name, output_buffer);
 
                 void* shm_addr = nullptr;
+                uint64_t offset = 0;
                 int rc = -1;
 
-                if (output_buffer.size() == sizeof(hipIpcMemHandle_t) &&
-                    !use_fabric_mem_) {
+                if (isIpcPayload(output_buffer) && !use_fabric_mem_) {
                     rc = openIPCHandle(output_buffer, &shm_addr);
+                    offset = ipcPayloadOffset(output_buffer);
                 } else if (output_buffer.size() == sizeof(hipxFabricHandle) &&
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
@@ -805,14 +862,12 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                 OpenedShmEntry shm_entry;
                 shm_entry.shm_addr = shm_addr;
                 shm_entry.length = entry.length;
+                shm_entry.offset = offset;
                 remap_entries_[std::make_pair(target_id, entry.addr)] =
                     shm_entry;
             }
 
-            // Calculate relocated address
-            auto shm_addr =
-                remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
-            dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+            relocate(remap_entries_[std::make_pair(target_id, entry.addr)]);
             return 0;
         }
     }
