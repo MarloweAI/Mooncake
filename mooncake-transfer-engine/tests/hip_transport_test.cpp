@@ -154,6 +154,8 @@ constexpr size_t kAllocLen = 4 * 1024 * 1024;
 constexpr size_t kSliceOffset = 1024 * 1024 + 4096;  // inside the allocation
 constexpr size_t kSliceLen = 64 * 1024;
 constexpr unsigned char kPattern = 0xAB;
+// Prefix of the destination's report line; the engine may also log to stdout.
+constexpr char kDstMarker[] = "HIP_IPC_DST ";
 enum DstExit {
     kDstOk = 0,
     kDstSliceWrong = 1,
@@ -184,7 +186,8 @@ int runIpcDestination(int port) {
                                     GPU_PREFIX + std::to_string(device)) != 0)
         return kDstSkip;
 
-    printf("%llu\n",
+    // P2P handshake binds a free port, so report the address it really uses.
+    printf("%s%s %llu\n", kDstMarker, engine->getLocalIpAndPort().c_str(),
            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(slice)));
     fflush(stdout);
     char go = 0;
@@ -245,8 +248,21 @@ TEST(HipTransportTest, IpcWriteLandsInBufferInsideLargerAllocation) {
     // The child prints its handshake address and the slice address once the
     // slice is registered.
     std::string line;
-    char c;
-    while (read(from_child[0], &c, 1) == 1 && c != '\n') line.push_back(c);
+    for (;;) {
+        std::string next;
+        char c;
+        bool got = false;
+        while (read(from_child[0], &c, 1) == 1) {
+            got = true;
+            if (c == '\n') break;
+            next.push_back(c);
+        }
+        if (next.rfind(kDstMarker, 0) == 0) {
+            line = next.substr(sizeof(kDstMarker) - 1);
+            break;
+        }
+        if (!got) break;  // EOF: the destination exited before reporting
+    }
     close(from_child[0]);
     if (line.empty()) {
         const int rc = finish_child();
